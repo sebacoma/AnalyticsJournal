@@ -1,0 +1,13 @@
+name: wdke
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - scipy
+  - pip
+  - pip:
+      - openai==0.28
