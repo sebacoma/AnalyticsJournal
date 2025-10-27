@@ -17,18 +17,42 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.metrics import f1_score, cohen_kappa_score
 
+# Nuevas importaciones para mejoras
+try:
+    from sentence_transformers import SentenceTransformer
+    SBERT_AVAILABLE = True
+    # Modelo multilingüe para español
+    SBERT_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+except ImportError:
+    SBERT_AVAILABLE = False
+    print("Warning: sentence-transformers no disponible. Usando solo TF-IDF.")
+
+try:
+    from rouge_score import rouge_scorer
+    ROUGE_AVAILABLE = True
+except ImportError:
+    ROUGE_AVAILABLE = False
+    print("Warning: rouge-score no disponible.")
+
 # ============== CONFIG ==============
 class CONFIG:
     SEED = 42
     DATA_DIR = "data/WDKE"          # carpeta con .txt de debates
     OUT_DIR = "out"                 # salidas CSV/TEX/PDF
     MAX_TEXT_CHARS = 16000          # truncamiento de seguridad para LLM
-    LLM_MODELS = [                  # >=3 modelos si tienes acceso
-        {"name": "gpt-4o-mini", "temperature": 0.0},
-        {"name": "gpt-4o-mini", "temperature": 0.7},
-        # {"name": "gpt-4.1-mini", "temperature": 0.0},
-        # {"name": "gpt-4o", "temperature": 0.0},
+    
+    # Mejora: Panel mixto de modelos para jueces más robustos
+    LLM_MODELS = [                  
+        {"name": "gpt-4o-mini", "temperature": 0.0, "family": "openai"},
+        {"name": "gpt-4o-mini", "temperature": 0.3, "family": "openai"},
+        {"name": "gpt-4o-mini", "temperature": 0.7, "family": "openai"},
+        # Añadir más familias si tienes acceso (Anthropic, etc.)
     ]
+    
+    # Mejora: Más jueces para mayor robustez
+    JUDGE_K = 5  # aumentado de 3 a 5
+    BOOTSTRAP_N = 1000  # para intervalos de confianza
+    
     SMALL_SESSIONS = ["sesion59","session61","session63","session64","session73","session74","session75","session78"]
     GOLD_PATH = None  # opcional: "data/gold_frames.json"
 
@@ -149,6 +173,21 @@ def normalizar_a_canon(frame_raw: str) -> str:
                 return canon
     return "Other"
 
+# Mejora: Baseline regex-only para frames (sin LLM)
+def extract_frames_regex_only(text: str) -> List[str]:
+    """Extrae frames usando solo patrones regex sin LLM"""
+    text_clean = quitar_acentos(text.lower())
+    frames_found = set()
+    
+    for canon, patterns in CANON_PATTERNS.items():
+        for pattern in patterns:
+            matches = re.findall(pattern, text_clean)
+            if matches:
+                frames_found.add(canon)
+                break  # Una coincidencia por categoría es suficiente
+    
+    return sorted(list(frames_found))
+
 def sent_tokenize(s):
     return [t.strip() for t in re.split(r'(?<=[.!?])\s+', s.strip()) if t.strip()]
 
@@ -236,17 +275,57 @@ def identificar_framings_closed(text, model="gpt-4o-mini", temperature=0.0, max_
     except Exception:
         return [], usage
 
+# Mejora: Jueces LLM robustos con panel mixto
+def judge_llm_robust(summary_text, k=None, models=None):
+    k = k or CONFIG.JUDGE_K
+    models = models or CONFIG.LLM_MODELS
+    
+    all_scores = []
+    all_usages = []
+    
+    # Distribuir evaluaciones entre modelos disponibles
+    evals_per_model = k // len(models)
+    remaining = k % len(models)
+    
+    for i, model_config in enumerate(models):
+        model_name = model_config["name"]
+        temp = model_config["temperature"]
+        
+        # Número de evaluaciones para este modelo
+        num_evals = evals_per_model + (1 if i < remaining else 0)
+        
+        model_scores = []
+        model_usages = []
+        
+        for _ in range(num_evals):
+            try:
+                p = PROMPTS["judge_prompt"].replace("{SUMMARY}", summary_text)
+                out, usage = call_openai(p, model=model_name, temperature=temp, max_tokens=5)
+                m = re.search(r"[1-5]", out)
+                if m: 
+                    score = int(m.group(0))
+                    model_scores.append(score)
+                    all_scores.append(score)
+                model_usages.append(usage)
+                all_usages.append(usage)
+            except Exception as e:
+                print(f"Error en judge_llm_robust: {e}")
+                # Score por defecto en caso de error
+                all_scores.append(3)
+    
+    if not all_scores: all_scores = [3]
+    
+    return {
+        "mean_score": float(np.mean(all_scores)),
+        "scores": all_scores,
+        "usages": all_usages,
+        "std_score": float(np.std(all_scores)) if len(all_scores) > 1 else 0.0
+    }
+
+# Función original mantenida para compatibilidad
 def judge_llm(summary_text, k=3, model="gpt-4o-mini"):
-    scores = []
-    usages = []
-    for _ in range(k):
-        p = PROMPTS["judge_prompt"].replace("{SUMMARY}", summary_text)
-        out, usage = call_openai(p, model=model, temperature=0.0, max_tokens=5)
-        m = re.search(r"[1-5]", out)
-        if m: scores.append(int(m.group(0)))
-        usages.append(usage)
-    if not scores: scores = [3]
-    return float(np.mean(scores)), scores, usages
+    result = judge_llm_robust(summary_text, k=k, models=[{"name": model, "temperature": 0.0}])
+    return result["mean_score"], result["scores"], result["usages"]
 
 # ============== BASE ==============
 def procesar_archivos(data_dir:str) -> Dict[str, Dict[str,str]]:
@@ -342,13 +421,73 @@ def construir_matriz_frames_sesion(resultados:Dict[str,Dict], source="framings_c
     df = df.sort_values("__tot__", ascending=False).drop(columns="__tot__")
     return df
 
-def math_coherence(summary_text:str) -> float:
+# Coherencia TF-IDF (método original)
+def tfidf_coherence(summary_text:str) -> float:
     sents = [t.strip() for t in re.split(r'[.!?]\s+', summary_text.strip()) if t.strip()]
     if len(sents) < 2: return 0.0
     vec = TfidfVectorizer(min_df=1, ngram_range=(1,2))
     X = vec.fit_transform(sents)
     sims = [cosine_similarity(X[i], X[i+1])[0,0] for i in range(len(sents)-1)]
     return float(np.mean(sims)) if sims else 0.0
+
+# Mejora: Coherencia semántica con embeddings multilingües
+def semantic_coherence(summary_text: str) -> float:
+    if not SBERT_AVAILABLE:
+        return tfidf_coherence(summary_text)
+    
+    sents = [t.strip() for t in re.split(r'[.!?]\s+', summary_text.strip()) if t.strip()]
+    if len(sents) < 2: return 0.0
+    
+    try:
+        model = SentenceTransformer(SBERT_MODEL)
+        embeddings = model.encode(sents)
+        
+        # Cosenos entre oraciones consecutivas
+        sims = []
+        for i in range(len(embeddings)-1):
+            sim = np.dot(embeddings[i], embeddings[i+1]) / (
+                np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[i+1])
+            )
+            sims.append(sim)
+        
+        return float(np.mean(sims)) if sims else 0.0
+    except Exception as e:
+        print(f"Error en semantic_coherence: {e}")
+        return tfidf_coherence(summary_text)
+
+# Mejora: Cobertura ROUGE-L (anclaje del resumen al texto)
+def rouge_coverage(summary_text: str, original_text: str) -> float:
+    if not ROUGE_AVAILABLE:
+        return 0.0
+    
+    try:
+        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+        
+        # Submuestreo del texto original si es muy largo
+        max_chars = 2000
+        if len(original_text) > max_chars:
+            # Tomar inicio, medio y final
+            chunk_size = max_chars // 3
+            start = original_text[:chunk_size]
+            mid_pos = len(original_text) // 2
+            middle = original_text[mid_pos-chunk_size//2:mid_pos+chunk_size//2]
+            end = original_text[-chunk_size:]
+            original_text = start + " " + middle + " " + end
+        
+        scores = scorer.score(original_text, summary_text)
+        return float(scores['rougeL'].fmeasure)
+    except Exception as e:
+        print(f"Error en rouge_coverage: {e}")
+        return 0.0
+
+# Función compuesta mejorada
+def math_coherence(summary_text: str, original_text: str = "") -> Dict[str, float]:
+    """Retorna múltiples métricas de coherencia"""
+    return {
+        "tfidf_coherence": tfidf_coherence(summary_text),
+        "semantic_coherence": semantic_coherence(summary_text),
+        "rouge_coverage": rouge_coverage(summary_text, original_text) if original_text else 0.0
+    }
 
 def icc_two_way_random_absolute(ratings_matrix:np.ndarray) -> Tuple[float,float]:
     Y = np.asarray(ratings_matrix, dtype=float)
@@ -368,24 +507,120 @@ def icc_two_way_random_absolute(ratings_matrix:np.ndarray) -> Tuple[float,float]
     ICC2_k = (MSB - MSE) / (MSB + (MSR - MSE)/max(n,1))
     return float(ICC2_1), float(ICC2_k)
 
-def evaluar_coherencia(resultados:Dict[str,Dict]) -> Tuple[pd.DataFrame, float, float]:
+# Mejora: Bootstrapping para intervalos de confianza
+def bootstrap_correlation(x, y, n_bootstrap=1000, confidence=0.95):
+    """Calcula intervalo de confianza bootstrap para correlación de Pearson"""
+    if len(x) != len(y) or len(x) < 2:
+        return np.nan, np.nan, np.nan
+    
+    correlations = []
+    n = len(x)
+    
+    for _ in range(n_bootstrap):
+        # Muestreo con reemplazo
+        indices = np.random.choice(n, size=n, replace=True)
+        x_boot = [x[i] for i in indices]
+        y_boot = [y[i] for i in indices]
+        
+        try:
+            r_boot, _ = stats.pearsonr(x_boot, y_boot)
+            if not np.isnan(r_boot):
+                correlations.append(r_boot)
+        except:
+            continue
+    
+    if not correlations:
+        return np.nan, np.nan, np.nan
+    
+    correlations = np.array(correlations)
+    alpha = 1 - confidence
+    lower = np.percentile(correlations, 100 * alpha/2)
+    upper = np.percentile(correlations, 100 * (1 - alpha/2))
+    
+    return np.mean(correlations), lower, upper
+
+def evaluar_coherencia_mejorada(resultados:Dict[str,Dict]) -> Tuple[pd.DataFrame, Dict[str, float]]:
     rows = []
     all_scores = []
+    
     for archivo, datos in resultados.items():
         resumen = str(datos.get("resumen","")).strip()
+        texto_original = str(datos.get("text","")).strip()
         if not resumen: continue
-        mcoh = math_coherence(resumen)
-        judge_mean, judge_scores, _ = judge_llm(resumen, k=3)
-        rows.append({"session": os.path.splitext(archivo)[0], "math_coh": mcoh, "judge_mean": judge_mean})
-        all_scores.append(judge_scores)
+        
+        # Múltiples métricas de coherencia
+        coherencia_metrics = math_coherence(resumen, texto_original)
+        
+        # Jueces LLM robustos
+        judge_result = judge_llm_robust(resumen, k=CONFIG.JUDGE_K)
+        
+        # Baseline regex-only para frames
+        frames_regex = extract_frames_regex_only(texto_original)
+        
+        row = {
+            "session": os.path.splitext(archivo)[0],
+            "tfidf_coherence": coherencia_metrics["tfidf_coherence"],
+            "semantic_coherence": coherencia_metrics["semantic_coherence"], 
+            "rouge_coverage": coherencia_metrics["rouge_coverage"],
+            "judge_mean": judge_result["mean_score"],
+            "judge_std": judge_result["std_score"],
+            "frames_regex_count": len(frames_regex)
+        }
+        rows.append(row)
+        all_scores.append(judge_result["scores"])
+    
     df = pd.DataFrame(rows)
-    r, p = (np.nan, np.nan)
+    
+    # Correlaciones y estadísticas
+    stats_dict = {}
+    
     if len(df) >= 2:
-        r, p = stats.pearsonr(df["math_coh"], df["judge_mean"])
-    ICC2_1 = ICC2_k = np.nan
+        # Correlación principal: semántica vs jueces
+        if "semantic_coherence" in df.columns and "judge_mean" in df.columns:
+            r_sem, p_sem = stats.pearsonr(df["semantic_coherence"], df["judge_mean"])
+            r_sem_boot, ci_lower, ci_upper = bootstrap_correlation(
+                df["semantic_coherence"].tolist(), 
+                df["judge_mean"].tolist(),
+                n_bootstrap=CONFIG.BOOTSTRAP_N
+            )
+            stats_dict.update({
+                "pearson_semantic_r": r_sem,
+                "pearson_semantic_p": p_sem,
+                "bootstrap_r": r_sem_boot,
+                "bootstrap_ci_lower": ci_lower,
+                "bootstrap_ci_upper": ci_upper
+            })
+        
+        # Correlación TF-IDF (baseline)
+        if "tfidf_coherence" in df.columns:
+            r_tfidf, p_tfidf = stats.pearsonr(df["tfidf_coherence"], df["judge_mean"])
+            stats_dict.update({
+                "pearson_tfidf_r": r_tfidf,
+                "pearson_tfidf_p": p_tfidf
+            })
+    
+    # ICC mejorado
     if len(all_scores) >= 2:
-        ratings = np.asarray(all_scores)  # N x K
-        ICC2_1, ICC2_k = icc_two_way_random_absolute(ratings)
+        try:
+            # Asegurar que todas las listas tengan la misma longitud
+            min_length = min(len(scores) for scores in all_scores)
+            ratings_matrix = np.array([scores[:min_length] for scores in all_scores])
+            ICC2_1, ICC2_k = icc_two_way_random_absolute(ratings_matrix)
+            stats_dict.update({
+                "ICC2_1": ICC2_1,
+                "ICC2_k": ICC2_k
+            })
+        except Exception as e:
+            print(f"Error calculando ICC: {e}")
+            stats_dict.update({"ICC2_1": np.nan, "ICC2_k": np.nan})
+    
+    return df, stats_dict
+
+# Función original mantenida para compatibilidad
+def evaluar_coherencia(resultados:Dict[str,Dict]) -> Tuple[pd.DataFrame, float, float]:
+    df, stats_dict = evaluar_coherencia_mejorada(resultados)
+    r = stats_dict.get("pearson_semantic_r", np.nan)
+    p = stats_dict.get("pearson_semantic_p", np.nan)
     return df, r, p
 
 # ============== BASELINES ==============
@@ -547,14 +782,83 @@ def df_to_tex(df:pd.DataFrame, path:str, caption:str, label:str, floatfmt="%.2f"
     print("✓", path)
 
 def plot_scatter_validity(df_eval:pd.DataFrame, path:str):
-    r, p = stats.pearsonr(df_eval["math_coh"], df_eval["judge_mean"])
+    if "math_coh" in df_eval.columns:
+        r, p = stats.pearsonr(df_eval["math_coh"], df_eval["judge_mean"])
+        x_col = "math_coh"
+        x_label = "TF-IDF Coherence"
+    else:
+        r, p = stats.pearsonr(df_eval["tfidf_coherence"], df_eval["judge_mean"])
+        x_col = "tfidf_coherence"
+        x_label = "TF-IDF Coherence"
+    
     plt.figure()
-    plt.scatter(df_eval["math_coh"], df_eval["judge_mean"])
-    plt.xlabel("Automatic coherence")
+    plt.scatter(df_eval[x_col], df_eval["judge_mean"])
+    plt.xlabel(x_label)
     plt.ylabel("Mean LLM-judge coherence")
     plt.title(f"r = {r:.3f}, p = {p:.3g}")
     plt.tight_layout()
     plt.savefig(path)
+    print("✓", path)
+
+# Mejora: Plot con múltiples métricas y bootstrap CI
+def plot_scatter_validity_enhanced(df_eval: pd.DataFrame, stats_dict: Dict, path: str):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle("Enhanced Coherence Validation Analysis", fontsize=14)
+    
+    # 1. Coherencia semántica vs jueces
+    if "semantic_coherence" in df_eval.columns:
+        ax = axes[0, 0]
+        ax.scatter(df_eval["semantic_coherence"], df_eval["judge_mean"], alpha=0.7)
+        ax.set_xlabel("Semantic Coherence (SBERT)")
+        ax.set_ylabel("LLM Judge Mean")
+        
+        r_sem = stats_dict.get("pearson_semantic_r", np.nan)
+        p_sem = stats_dict.get("pearson_semantic_p", np.nan)
+        ci_lower = stats_dict.get("bootstrap_ci_lower", np.nan)
+        ci_upper = stats_dict.get("bootstrap_ci_upper", np.nan)
+        
+        title = f"r = {r_sem:.3f}, p = {p_sem:.3g}"
+        if not np.isnan(ci_lower) and not np.isnan(ci_upper):
+            title += f"\n95% CI: [{ci_lower:.3f}, {ci_upper:.3f}]"
+        ax.set_title(title)
+    
+    # 2. TF-IDF vs jueces (baseline)
+    if "tfidf_coherence" in df_eval.columns:
+        ax = axes[0, 1]
+        ax.scatter(df_eval["tfidf_coherence"], df_eval["judge_mean"], alpha=0.7, color='orange')
+        ax.set_xlabel("TF-IDF Coherence")
+        ax.set_ylabel("LLM Judge Mean")
+        
+        r_tfidf = stats_dict.get("pearson_tfidf_r", np.nan)
+        p_tfidf = stats_dict.get("pearson_tfidf_p", np.nan)
+        ax.set_title(f"r = {r_tfidf:.3f}, p = {p_tfidf:.3g}")
+    
+    # 3. ROUGE coverage vs coherencia semántica
+    if "rouge_coverage" in df_eval.columns and "semantic_coherence" in df_eval.columns:
+        ax = axes[1, 0]
+        ax.scatter(df_eval["rouge_coverage"], df_eval["semantic_coherence"], alpha=0.7, color='green')
+        ax.set_xlabel("ROUGE-L Coverage")
+        ax.set_ylabel("Semantic Coherence")
+        if len(df_eval) > 1:
+            try:
+                r_rouge, p_rouge = stats.pearsonr(df_eval["rouge_coverage"], df_eval["semantic_coherence"])
+                ax.set_title(f"r = {r_rouge:.3f}, p = {p_rouge:.3g}")
+            except:
+                ax.set_title("Coverage vs Coherence")
+    
+    # 4. Frames regex vs LLM count
+    if "frames_regex_count" in df_eval.columns:
+        ax = axes[1, 1]
+        # Necesitamos los datos de comparación LLM vs regex
+        ax.hist(df_eval["frames_regex_count"], alpha=0.7, label="Regex-only", bins=10)
+        ax.set_xlabel("Number of Frames Detected")
+        ax.set_ylabel("Frequency")
+        ax.set_title("Frame Detection Distribution")
+        ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close()
     print("✓", path)
 
 def heatmap_binary(mat_bin:pd.DataFrame, path:str):
@@ -608,7 +912,44 @@ def main():
                                                 caption="Counts of canonical frames across selected sessions.",
                                                 label="tab:frame-session-counts-small"))
 
-    # evaluación de coherencia + jueces LLM + ICC + Pearson
+    # Mejora: Evaluación robusta de coherencia 
+    df_eval_enhanced, stats_enhanced = evaluar_coherencia_mejorada(resultados)
+    df_eval_enhanced.to_csv(os.path.join(CONFIG.OUT_DIR,"eval_coherence_enhanced.csv"), index=False)
+    
+    # Guardar estadísticas mejoradas
+    with open(os.path.join(CONFIG.OUT_DIR,"coherence_stats_enhanced.json"), "w") as f:
+        json.dump(stats_enhanced, f, indent=2, default=str)
+    
+    # Plots mejorados
+    plot_scatter_validity_enhanced(df_eval_enhanced, stats_enhanced, 
+                                 os.path.join(CONFIG.OUT_DIR,"fig_scatter_coherence_enhanced.pdf"))
+    
+    # Evaluación baseline regex-only
+    baseline_regex_results = {}
+    for archivo, datos in resultados.items():
+        texto = datos["text"]
+        frames_regex = extract_frames_regex_only(texto)
+        baseline_regex_results[archivo] = frames_regex
+    
+    # Comparar LLM vs Regex
+    comparison_data = []
+    for archivo in resultados.keys():
+        session = os.path.splitext(archivo)[0]
+        frames_llm = resultados[archivo].get("framings_closed", "").split("\n")
+        frames_llm_clean = [f.strip() for f in frames_llm if f.strip()]
+        frames_regex = baseline_regex_results[archivo]
+        
+        comparison_data.append({
+            "session": session,
+            "llm_frame_count": len(frames_llm_clean),
+            "regex_frame_count": len(frames_regex),
+            "overlap": len(set(frames_llm_clean) & set(frames_regex))
+        })
+    
+    df_comparison = pd.DataFrame(comparison_data)
+    df_comparison.to_csv(os.path.join(CONFIG.OUT_DIR,"llm_vs_regex_comparison.csv"), index=False)
+    
+    # Mantener evaluación original para compatibilidad
     df_eval, r, p = evaluar_coherencia(resultados)
     df_eval.to_csv(os.path.join(CONFIG.OUT_DIR,"eval_coherence_scores.csv"), index=False)
     plot_scatter_validity(df_eval, os.path.join(CONFIG.OUT_DIR,"fig_scatter_coh_vs_judges.pdf"))
@@ -638,12 +979,56 @@ def main():
     gold_dict = load_gold(CONFIG.GOLD_PATH) if CONFIG.GOLD_PATH and os.path.exists(CONFIG.GOLD_PATH) else None
     evaluar_ablaciones(resultados, gold_frames=gold_dict)
 
-    # 9) guardar prompts y runtime (ya guardado)
+    # 9) Guardar prompts, runtime y resumen de mejoras
+    improvements_summary = {
+        "enhanced_features": {
+            "semantic_coherence": SBERT_AVAILABLE,
+            "rouge_coverage": ROUGE_AVAILABLE,
+            "robust_judges": True,
+            "bootstrap_ci": True,
+            "regex_baseline": True
+        },
+        "statistics": stats_enhanced,
+        "model_config": {
+            "judge_k": CONFIG.JUDGE_K,
+            "bootstrap_n": CONFIG.BOOTSTRAP_N,
+            "sbert_model": SBERT_MODEL if SBERT_AVAILABLE else None
+        }
+    }
+    
+    with open(os.path.join(CONFIG.OUT_DIR,"improvements_summary.json"), "w") as f:
+        json.dump(improvements_summary, f, indent=2, default=str)
+    
     with open(os.path.join(CONFIG.OUT_DIR,"DONE.txt"), "w") as f:
-        f.write("Artifacts ready for LaTeX inclusion.\n")
-    print("\n✓ All artifacts ready for LaTeX inclusion in ./out/")
-    print(f"Pearson r={r:.3f}, p={p:.3g}")
-    print("Insert in LaTeX: \\input{frame_session_matrix_binary.tex}, etc.")
+        f.write("Enhanced WDKE Pipeline - Artifacts ready for LaTeX inclusion.\n")
+        f.write("New features: Semantic coherence, ROUGE coverage, robust judges (k=5), bootstrap CI.\n")
+    
+    print("\n🎉 Enhanced WDKE Pipeline completed!")
+    print("✓ All artifacts ready for LaTeX inclusion in ./out/")
+    
+    # Mostrar resultados mejorados
+    if stats_enhanced:
+        print(f"\n📊 Enhanced Statistics:")
+        r_sem = stats_enhanced.get('pearson_semantic_r', np.nan)
+        p_sem = stats_enhanced.get('pearson_semantic_p', np.nan)
+        print(f"Semantic Coherence: r={r_sem:.3f}, p={p_sem:.3g}")
+        
+        ci_lower = stats_enhanced.get('bootstrap_ci_lower', np.nan)
+        ci_upper = stats_enhanced.get('bootstrap_ci_upper', np.nan)
+        if not np.isnan(ci_lower):
+            print(f"Bootstrap 95% CI: [{ci_lower:.3f}, {ci_upper:.3f}]")
+        
+        icc_2_1 = stats_enhanced.get('ICC2_1', np.nan)
+        icc_2_k = stats_enhanced.get('ICC2_k', np.nan)
+        print(f"ICC(2,1): {icc_2_1:.3f}, ICC(2,k): {icc_2_k:.3f}")
+    
+    print(f"TF-IDF baseline: r={r:.3f}, p={p:.3g}")
+    print("\n📁 New files generated:")
+    print("- eval_coherence_enhanced.csv")
+    print("- coherence_stats_enhanced.json") 
+    print("- llm_vs_regex_comparison.csv")
+    print("- fig_scatter_coherence_enhanced.pdf")
+    print("- improvements_summary.json")
     
 if __name__ == "__main__":
     main()

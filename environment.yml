@@ -11,3 +11,6 @@ dependencies:
   - pip
   - pip:
       - openai==0.28
+      - sentence-transformers
+      - rouge-score
+      - python-dotenv
