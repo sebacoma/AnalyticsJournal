@@ -12,7 +12,6 @@ This project implements a robust methodology for extracting and analyzing politi
 - **Reliability assessment** (ICC, κ coefficients)
 - **Validity evaluation** (Pearson correlation)
 - **Ablation studies** and baselines
-- **LaTeX-ready outputs** for academic publication
 
 ## Features
 
