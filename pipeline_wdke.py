@@ -1,27 +1,9 @@
-# -*- coding: utf-8 -*-
-"""
-WDKE Pipeline end-to-end (Conda + VS Code):
-- Resúmenes LLM y extractivos
-- Extracción de frames (open vs closed)
-- Normalización a taxonomía
-- Baselines y Ablaciones
-- Fiabilidad (ICC LLM-judges), κ y macro-F1 vs GOLD (opcional)
-- Validez (Pearson coherencia-LLM judges)
-- Costos/latencia/prompts/semillas/versiones
-- Export CSV, TEX, PDF (para LaTeX \input y \includegraphics)
-
-Requisitos:
-  - environment.yml (Conda)
-  - OPENAI_API_KEY en el entorno (no hardcodear)
-
-Ajusta rutas en CONFIG abajo.
-"""
 import os, sys, re, json, time, random, platform, unicodedata
 from dataclasses import dataclass
 from collections import Counter
 from typing import Dict, List, Tuple, Optional
 
-# Cargar variables de entorno desde .env
+# Cargar variables de entorno
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -130,7 +112,6 @@ CANON_PATTERNS = {
 
 # ============== UTILIDADES ==============
 def leer_archivo(path:str) -> str:
-    # Intentar diferentes encodings para manejar archivos con formatos diversos
     encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
     for encoding in encodings:
         try:
@@ -138,7 +119,6 @@ def leer_archivo(path:str) -> str:
                 return f.read()
         except UnicodeDecodeError:
             continue
-    # Si ninguno funciona, usar 'utf-8' con errores ignorados
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
@@ -268,7 +248,7 @@ def judge_llm(summary_text, k=3, model="gpt-4o-mini"):
     if not scores: scores = [3]
     return float(np.mean(scores)), scores, usages
 
-# ============== PIPELINE BASE ==============
+# ============== BASE ==============
 def procesar_archivos(data_dir:str) -> Dict[str, Dict[str,str]]:
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Data dir not found: {data_dir}")
@@ -591,10 +571,10 @@ def heatmap_binary(mat_bin:pd.DataFrame, path:str):
 
 # ============== MAIN ==============
 def main():
-    # 1) pipeline base
+    #  base
     resultados = procesar_archivos(CONFIG.DATA_DIR)
 
-    # 2) frecuencias y normalización (closed por defecto)
+    # frecuencias y normalización (closed por defecto)
     df_frames_raw = tabla_frecuencia_frames([d["framings_open"] for d in resultados.values()])
     df_frames_raw.to_csv(os.path.join(CONFIG.OUT_DIR, "frames_frecuencia_filtrada.csv"), index=False)
     df_norm = normalizar_df_frames(df_frames_raw)
@@ -602,7 +582,7 @@ def main():
     df_to_tex(top10, os.path.join(CONFIG.OUT_DIR,"frames_top10_normalizados.tex"),
               "Top--10 canonical frames.", "tab:top10")
 
-    # 3) matrices Frame×Sesión
+    # matrices Frame×Sesión
     mat_bin = construir_matriz_frames_sesion(resultados, source="framings_closed", mode="binary", include_other=False)
     mat_cnt = construir_matriz_frames_sesion(resultados, source="framings_closed", mode="count", include_other=False)
 
@@ -615,7 +595,7 @@ def main():
     with open(os.path.join(CONFIG.OUT_DIR,"frame_session_matrix_counts.tex"), "w") as f:
         f.write(mat_cnt.to_latex(longtable=True, escape=False, caption="Counts of canonical frames across sessions.", label="tab:frame-session-counts"))
 
-    # versión reducida para el cuerpo del paper
+    # versión reducida 
     colmap_bin = {c.lower(): c for c in mat_bin.columns}
     cols_small = [colmap_bin[k] for k in CONFIG.SMALL_SESSIONS if k in colmap_bin]
     if cols_small:
@@ -628,20 +608,20 @@ def main():
                                                 caption="Counts of canonical frames across selected sessions.",
                                                 label="tab:frame-session-counts-small"))
 
-    # 4) evaluación de coherencia + jueces LLM + ICC + Pearson
+    # evaluación de coherencia + jueces LLM + ICC + Pearson
     df_eval, r, p = evaluar_coherencia(resultados)
     df_eval.to_csv(os.path.join(CONFIG.OUT_DIR,"eval_coherence_scores.csv"), index=False)
     plot_scatter_validity(df_eval, os.path.join(CONFIG.OUT_DIR,"fig_scatter_coh_vs_judges.pdf"))
 
-    # 5) heatmap binario (opcional)
+    # heatmap binario (opcional)
     heatmap_binary(mat_bin, os.path.join(CONFIG.OUT_DIR,"fig_heatmap_frames_sessions.pdf"))
 
-    # 6) baseline extractivo y costos multillm (muestra)
+    # baseline extractivo y costos multillm (muestra)
     baseline_ext = run_extractive_baseline(resultados)
     sample_paths = [os.path.join(CONFIG.DATA_DIR, f) for f in sorted(os.listdir(CONFIG.DATA_DIR))[:10]]
     run_multillm_costs(sample_paths)
 
-    # 7) GOLD opcional -> macro-F1 y κ
+    # macro-F1 y κ
     if CONFIG.GOLD_PATH and os.path.exists(CONFIG.GOLD_PATH):
         gold = load_gold(CONFIG.GOLD_PATH)
         # usa open-world + normalización/closed remapeo por defecto (full)
@@ -654,7 +634,7 @@ def main():
         with open(os.path.join(CONFIG.OUT_DIR,"gold_eval.json"), "w") as f:
             json.dump({"macroF1": f1_macro, "kappa": kappa}, f, indent=2)
 
-    # 8) ablaciones (con o sin GOLD)
+    # ablaciones 
     gold_dict = load_gold(CONFIG.GOLD_PATH) if CONFIG.GOLD_PATH and os.path.exists(CONFIG.GOLD_PATH) else None
     evaluar_ablaciones(resultados, gold_frames=gold_dict)
 
