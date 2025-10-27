@@ -60,7 +60,7 @@ cp .env.example .env
 # Edit .env and add your OPENAI_API_KEY
 ```
 
-## 🚀 Usage
+## Usage
 
 ### Basic Execution
 
@@ -92,7 +92,7 @@ class CONFIG:
     GOLD_PATH = None  # Optional: path to gold standard
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 ├── data/
@@ -111,7 +111,7 @@ class CONFIG:
 └── README.md                    # This file
 ```
 
-## 📈 Outputs
+## Outputs
 
 The pipeline generates publication-ready artifacts:
 
@@ -131,7 +131,7 @@ The pipeline generates publication-ready artifacts:
 - `baseline_multillm_costs.csv` - Model cost comparison
 - `repro_runtime.json` - Reproducibility metadata
 
-## 🔬 Methodology
+## Methodology
 
 ### Frame Taxonomy (13 Categories)
 - Crisis/Urgency
@@ -155,14 +155,14 @@ The pipeline generates publication-ready artifacts:
 4. **No LLM Remap**: Without LLM-based "Other" remapping
 5. **No Closed Tax**: Without closed taxonomy constraint
 
-## 📊 Evaluation Metrics
+## Evaluation Metrics
 
 - **ICC(2,1) & ICC(2,k)**: Inter-rater reliability for LLM judges
 - **Pearson r**: Correlation between mathematical and LLM coherence
 - **Macro-F1**: Frame identification performance vs. gold standard
 - **Cohen's κ**: Agreement coefficient vs. gold standard
 
-## 🔧 Technical Details
+## Technical Details
 
 ### Robust File Handling
 Supports multiple encodings (UTF-8, Latin1, CP1252, ISO-8859-1) for diverse input files.
@@ -178,7 +178,7 @@ Supports multiple encodings (UTF-8, Latin1, CP1252, ISO-8859-1) for diverse inpu
 - Graceful degradation for encoding issues
 - Comprehensive error logging
 
-## 📝 Citation
+## Citation
 
 If you use this pipeline in your research, please cite:
 
@@ -191,11 +191,11 @@ If you use this pipeline in your research, please cite:
 }
 ```
 
-## 📄 License
+## License
 
 [Add your preferred license]
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -203,7 +203,7 @@ If you use this pipeline in your research, please cite:
 4. Push to the branch
 5. Create a Pull Request
 
-## 📞 Support
+## Support
 
 For questions or issues, please open a GitHub issue or contact [your-email].
 
